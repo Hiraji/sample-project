@@ -1,0 +1,130 @@
+---
+# Installs a ros user into the machine
+
+# Install packages a ros user will need
+- name: Install packages
+  apt: name={{item}}
+  with_items:
+    - git
+    - vim
+    - emacs
+    - tree
+    - htop
+    - terminator
+    - synaptic
+    - wajig
+
+# We put all users in the ros group, so they can work togther easily
+- name: Add ros group
+  group: name=ros
+
+- name: "Add ROS user"
+  user: name={{ros_user}}
+    comment="{{ros_user_comment}}"
+    shell=/bin/bash
+    append=yes groups={{ros_group}},adm,sudo,plugdev,cdrom
+
+- debug: msg="Added user named:{{ros_user}} in group:ros"
+
+- name: Set users password
+  shell: "echo '{{ros_user}}:{{ros_user_password}}' | chpasswd"
+
+- name: Give user passwordless sudo.
+  lineinfile: "dest=/etc/sudoers state=present regexp='^{{ros_user}}' line='{{ros_user}}  ALL=(ALL) NOPASSWD:  ALL' insertafter=EOF"
+
+- name: Delete existing icons from ~{{ros_user}}
+  shell: "rm -f ~{{ros_user}}/Desktop/*"
+  sudo: yes
+
+- name: Install home directory files from {{ros_user_home_files}}
+  copy: src="{{ros_user_home_files}}/" dest="~{{ros_user}}/" owner={{ros_user}} group={{ros_group}}
+  when: ros_user_home_files|default("") != ""
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: Copy icons to /usr/local/share/icons
+  copy: src="files/icons" dest="/usr/local/share"
+  sudo: yes
+
+- name: Set executable bit for icons
+  shell: "find ~{{ros_user}}/Desktop/*.desktop -exec chmod +x {} +"
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: Test for existing bashrc setup
+  shell: grep '^source.*/setup\.bash' ~{{ros_user}}/.bashrc
+  register: setup_test_result
+  ignore_errors: true
+
+# Add a source line to bashrc, only if there isn't already one
+- name: Update bashrc to point to ROS {{ros_release}}
+  lineinfile: dest=~{{ros_user}}/.bashrc
+              line="source /opt/ros/{{ros_release}}/setup.bash"
+              regexp='^source.*/setup\.bash'
+              insertafter=EOF
+              backup=yes
+  when: setup_test_result.rc != 0
+
+- name: Copy background over
+  when: ros_user_background is defined and ros_user_background != "" and background_destination_folder is defined and background_destination_folder != ""
+  copy: src={{ros_user_background}}
+        dest={{background_destination_folder}}
+
+# http://askubuntu.com/questions/276509/change-gsettings-without-running-x-and-unity
+# http://askubuntu.com/questions/66914/how-to-change-desktop-background-from-command-line-in-unity
+# http://askubuntu.com/questions/418171/set-desktop-background-from-command-line-over-ssh#
+- name: Set users background
+  when: ros_user_background is defined and ros_user_background != "" and background_destination_folder is defined and background_destination_folder != ""
+  shell: "dbus-launch --exit-with-session gsettings set org.gnome.desktop.background picture-uri file://{{background_destination_folder}}{{ros_user_background|basename}}"
+  register: command_result
+  failed_when: '"exited with non-zero exit status" in command_result.stderr'
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+# Default font a bit large for a VM
+# There are others we could tweak if we wanted to:
+# http://www.techheadz.co.uk/279.html#.UyGH9d_qIz0
+- name: Set monospace font
+  when: monospace_font is defined and monospace_font !=""
+  shell: "dbus-launch --exit-with-session gsettings set org.gnome.desktop.interface monospace-font-name '{{monospace_font}}'"
+  register: command_result
+  failed_when: '"exited with non-zero exit status" in command_result.stderr'
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: Disable screen save and lock
+  when: ros_user_disable_lock
+  shell: "dbus-launch --exit-with-session gsettings {{ item }}"
+  register: command_result
+  failed_when: '"exited with non-zero exit status" in command_result.stderr'
+  with_items:
+    - "set org.gnome.desktop.screensaver idle-activation-enabled false"
+    - "set org.gnome.desktop.screensaver lock-enabled false"
+    - "set org.gnome.desktop.screensaver ubuntu-lock-on-suspend false"
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+
+- name: Update rosdep
+  shell: bash -c "source /opt/ros/{{ros_release}}/setup.bash && rosdep update"
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: Setup git name
+  command: git config --global user.name "{{ros_user}}"
+
+- name: Setup git email
+  command: git config --global user.email "{{ros_user_email}}"
+
+- name: Color prompt
+  lineinfile: dest=~{{ ros_user }}/.bashrc
+    line="force_color_prompt=yes"
+    regexp="^#?force_color_prompt="
+
+- name: Set autologin user to {{ros_user}}
+  when: ros_user_autologin
+  lineinfile: dest={{ lightdm_conf }} line="autologin-user={{ros_user}}"
+
+- name: Set autologin to true
+  when: ros_user_autologin
+  lineinfile: dest={{ lightdm_conf }} line="autologin-user-timeout=0"

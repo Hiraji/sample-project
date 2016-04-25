@@ -1,0 +1,5 @@
+---
+# Defaults for build PR only variables
+
+run_build: yes
+run_install: yes

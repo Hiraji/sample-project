@@ -1,0 +1,171 @@
+---
+# Set up a ROS workspace, install a .rosinstall and compile.
+
+- name: Delete any files in {{ros_workspace}} to have a fresh workspace
+  shell: "rm -rf {{ros_workspace}}"
+  sudo: yes
+
+- name: Delete any files in {{ros_workspace}}_deps to have a fresh workspace
+  shell: "rm -rf {{ros_workspace}}_deps"
+  sudo: yes
+
+- name: Create workspace for dependencies {{ros_workspace}}_deps
+  file: state=directory path={{ros_workspace}}_deps/src owner={{ros_user}} group={{ros_group}}
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: catkin_init_workspace deps
+  shell: bash -c "source /opt/ros/{{ros_release}}/setup.bash && catkin_init_workspace"
+    chdir={{ros_workspace}}_deps/src
+    creates={{ros_workspace}}_deps/src/CMakeLists.txt
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+# Do an initial make of the empty workspace to get a setup.bash.
+# If there is one already don't do this, so we don't trigger a big make
+- name: catkin make workspace deps
+  shell: bash -c "source /opt/ros/{{ros_release}}/setup.bash && catkin_make"
+    chdir={{ros_workspace}}_deps
+    creates={{ros_workspace}}_deps/devel/setup.bash
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: Create workspace {{ros_workspace}}
+  file: state=directory path={{ros_workspace}}/src owner={{ros_user}} group={{ros_group}}
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: catkin_init_workspace
+  shell: bash -c "source {{ros_workspace}}_deps/devel/setup.bash && catkin_init_workspace"
+    chdir={{ros_workspace}}/src
+    creates={{ros_workspace}}/src/CMakeLists.txt
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+# Do an initial make of the empty workspace to get a setup.bash.
+# If there is one already don't do this, so we don't trigger a big make
+- name: catkin make workspace
+  shell: bash -c "source {{ros_workspace}}_deps/devel/setup.bash && catkin_make"
+    chdir={{ros_workspace}}
+    creates={{ros_workspace}}/devel/setup.bash
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: Update users bashrc to point to the workspace
+  lineinfile: dest=~{{ros_user}}/.bashrc
+              line="source {{ros_workspace}}/devel/setup.bash"
+              regexp='^source.*/setup\.bash'
+              insertafter=EOF
+              backup=yes
+
+- name: Copy install file, replacing login / password if necessary
+  template: src={{ros_workspace_install}} dest=/tmp/ansible-ros-workspace.rosinstall
+
+#
+# When using private repos ssh key checks can become a pain so we generate the
+# keys first.
+# http://blog.kollerie.com/2014/02/18/ansible_git_ssh/
+#
+#- name: Find repo domains
+#  shell: 'grep "uri" /tmp/ansible-ros-workspace.rosinstall | sed -n -e "s/^.*@\(.*\):.*$/\1/p" | sort | uniq'
+#  register: repo_domains
+
+#- name: Get repo hosts keys
+#  shell: ssh-keyscan "{{item}}"
+#  with_items: repo_domains.stdout_lines
+#  register: repo_host_keys
+#  when: repo_domains.stdout is defined and repo_domains.stdout is not ""
+
+#- name: Add host keys for repos
+#  lineinfile: create=yes dest="~/.ssh/known_hosts" line='{{ item.stdout }}' state=present
+#  with_items: repo_host_keys.results
+#  when: repo_host_keys is defined and repo_host_keys.stdout is defined and repo_host_keys.stdout is not ""
+
+- name: Init workspace
+  command: wstool init .
+    chdir={{ros_workspace}}/src
+    creates={{ros_workspace}}/src/.rosinstall
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: Merge {{ros_workspace}} into workspace
+  command: wstool merge -y /tmp/ansible-ros-workspace.rosinstall
+    chdir={{ros_workspace}}/src
+  # Run as root to allow forward keys for github access
+  sudo: yes
+
+- name: Workspace update
+  command: wstool up --delete-changed-uris -j5
+           chdir={{ros_workspace}}/src
+  # Run as root to allow forward keys for github access
+  sudo: yes
+
+- name: Init workspace for dependencies
+  command: wstool init .
+    chdir={{ros_workspace}}_deps/src
+    creates={{ros_workspace}}_deps/src/.rosinstall
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: Create /tmp/{{ros_workspace}}_deps to store deps rosinstalls
+  file: state=directory path=/tmp/{{ros_workspace}}_deps/{{item | dirname}} owner={{ros_user}} group={{ros_group}}
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+  with_fileglob:
+    - '{{ros_workspace}}/src/*/repository.rosinstall'
+
+
+- name: Copy dependencies install file, replacing login / password if necessary
+  template: src={{item}} dest=/tmp/{{ros_workspace}}_deps/{{item}}.rosinstall
+  with_fileglob:
+    - '{{ros_workspace}}/src/*/repository.rosinstall'
+
+- name: Pull source dependencies to {{ros_workspace}}_deps
+  shell: for INSTALL in `find /tmp/{{ros_workspace}}_deps/ -name "*.rosinstall"`; do wstool merge -y ${INSTALL} ; done
+         chdir={{ros_workspace}}_deps/src
+  sudo: yes
+
+- name: Workspace update {{ros_workspace}}_deps
+  command: wstool up --delete-changed-uris -j5
+           chdir={{ros_workspace}}_deps/src
+  # Run as root to allow forward keys for github access
+  sudo: yes
+
+- name: Delete duplicated deps
+  shell: for BASE_SRC in `ls {{ros_workspace}}/src` ; do if [ -d {{ros_workspace}}_deps/src/${BASE_SRC} ]; then rm -rf {{ros_workspace}}_deps/src/${BASE_SRC}; fi ; done
+  sudo: yes
+
+- name: Fix perms (As we installed code as root, fix the perms.)
+  file: path={{ros_workspace}} recurse=yes owner={{ros_user}} group={{ros_group}}
+  sudo: yes
+
+- name: Fix perms for deps (As we installed code as root, fix the perms.)
+  file: path={{ros_workspace}}_deps recurse=yes owner={{ros_user}} group={{ros_group}}
+  sudo: yes
+
+- name: Install dependencies of the source deps
+  script: ../files/rosdep_install.sh {{ros_workspace}}_deps
+
+# Now build the code we just installed.
+- name: catkin_make for deps
+  shell: bash -c "source {{ros_workspace}}_deps/devel/setup.bash && catkin_make"
+    chdir={{ros_workspace}}_deps
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: Install dependencies
+  script: ../files/rosdep_install.sh {{ros_workspace}}
+
+# Now build the code we just installed.
+- name: catkin_make
+  shell: bash -c "source {{ros_workspace}}_deps/devel/setup.bash && catkin_make"
+    chdir={{ros_workspace}}
+  sudo: yes
+  sudo_user: "{{ros_user}}"
+
+- name: Add ws_update alias for updating the workspace to ~/.bashrc
+  lineinfile: dest=~{{ros_user}}/.bashrc
+              line="alias ws_update='current_dir=$PWD && roscd && cd ../src &&  wstool foreach --git \"git pull\" && cd .. && catkin_make && cd $current_dir'"
+              regexp='^alias ws_update.*'
+              insertafter=EOF
+              backup=yes

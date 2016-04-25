@@ -1,0 +1,194 @@
+#!/usr/bin/python -u
+#
+# Copyright 2011 Shadow Robot Company Ltd.
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 2 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+# Requires launchpadlib:
+#
+#     $ sudo apt-get install python-launchpadlib
+#     # or
+#     pip install launchpadlib
+#
+
+import os, sys, datetime, subprocess, optparse
+from launchpadlib.launchpad import Launchpad
+
+class LPMirror(object):
+    def __init__(self,
+                 cachedir         = "~/.launchpadlib/cache",
+                 credentials_file = None,
+                 local_bzr        = '',
+                 teams            = [],
+                 debug            = False,
+                 ):
+        """
+        Bzr mirror LP branches to a local repo
+        """
+        self.lp = Launchpad.login_with(
+                'LP Branch Mirror', 'production', cachedir,
+                credential_save_failed = self.no_credential,
+                credentials_file = credentials_file)
+        self.local_bzr = local_bzr
+        self.teams     = teams
+        self.debug     = debug
+
+    def no_credential(self):
+        raise Exception("Can't proceed without Launchpad credential.")
+
+    def mirror(self):
+        """
+        Run the mirror.
+        """
+        if not os.path.isdir(self.local_bzr):
+            raise Exception("local_bzr '%s' is not a directory"%self.local_bzr)
+
+        print str(datetime.datetime.now()) + " Starting mirror"
+        branches = []
+        for team_name in self.teams:
+            team = self.lp.people(team_name)
+            for branch in team.getBranches():
+                branches.append(branch)
+                self.mirror_branch(branch)
+        self.prune_branches(branches)
+        print str(datetime.datetime.now()) + " Finished mirror"
+
+    def branch_bits(self, branch):
+        """
+        Return project and branch name from a branch object retrieved from
+        the API based on its LP id.
+        """
+        project = ""
+        branch_name = "trunk"
+        bits = branch.bzr_identity.split('/')
+        l = len(bits)
+        if l == 1: # e.g. lp:sr-build-tools
+            project = bits[0][3:] # remove lp:
+        elif l == 2: # e.g. lp:sr-manipulation/stable
+            project     = bits[0][3:] # remove lp:
+            branch_name = bits[1]
+        elif l == 3: # e.g. lp:~shadowrobot/sr-ros-interface/manip-electric
+            project     = bits[1]
+            branch_name = bits[2]
+        return (project, branch_name)
+
+    def mirror_branch(self, branch):
+        print "Mirror: " + str(branch)
+        project, branch_name = self.branch_bits(branch)
+        if not self.project_exists(project):
+            self.project_init(project)
+        if self.branch_exists(project, branch_name):
+            self.branch_pull(project, branch_name)
+        else:
+            self.branch_init(project, branch_name, branch.bzr_identity)
+
+    def prune_branches(self, branches):
+        """Remove branches from disk not in the list passed"""
+        # Dict look up for (project, branch_name) tuples that exist on the
+        # remote side, ie in LP
+        remote = {}
+        for branch in branches:
+            remote[(self.branch_bits(branch))] = 1
+
+        # Scan local repo and remove any (project, branch_name) we have
+        # that is not in the remote lookup.
+        for proj in os.listdir(self.local_bzr):
+            path = os.path.join(self.local_bzr, proj)
+            if not os.path.isdir(path): continue
+            if proj[0] == ".": continue
+            for bran in os.listdir(path):
+                path = os.path.join(self.local_bzr, proj, bran)
+                if not os.path.isdir(path): continue
+                if bran[0] == ".": continue
+                if (proj, bran) in remote: continue
+                self.branch_rm(proj, bran)
+
+    def check_call(self, cmd):
+        if self.debug and cmd[0] == "bzr":
+            cmd.append("--verbose")
+            print cmd
+        subprocess.check_call(cmd)
+
+    def project_exists(self, name):
+        if os.path.exists(os.path.join(self.local_bzr, name)):
+            return True
+        return False
+
+    def project_init(self, name):
+        path = os.path.join(self.local_bzr, name)
+        cmd = ["bzr", "init-repository", "--no-trees", path]
+        self.check_call(cmd)
+
+    def branch_exists(self, project, name):
+        if os.path.exists(os.path.join(self.local_bzr, project, name)):
+            return True
+        return False
+
+    def branch_pull(self, project, name):
+        path = os.path.join(self.local_bzr, project, name)
+        cmd = ["bzr", "pull", "--directory", path, "--overwrite"]
+        self.check_call(cmd)
+
+    def branch_init(self, project, name, lpid):
+        path = os.path.join(self.local_bzr, project, name)
+        cmd = ["bzr", "branch", lpid, path]
+        self.check_call(cmd)
+
+    def branch_rm(self, project, name):
+        path = os.path.join(self.local_bzr, project, name)
+        cmd = ["rm", "-r", "-f", path]
+        self.check_call(cmd)
+        print "Removed:", path
+        # TODO - Cleanup empty project directory if last branch
+
+
+def main():
+    """Process command line options and hand off to LPMirror"""
+    usage="""
+  %prog [OPTIONS] LOCAL_BZR_DIR TEAM [TEAM...]
+
+  LOCAL_BZR_DIR - Directory containing the local mirror.
+  TEAM          - One or more LP team names. All the teams branches get
+                  mirrored into LOCAL_BZR_DIR.
+Example:
+  lp-mirror /srv/bzr shadowrobot"""
+    optp = optparse.OptionParser(usage=usage)
+    optp.add_option('--credentials-file', '--creds', default=None, metavar='FILE',
+            help="File to store credentials. You will need this if you plan to"
+            " run unatteneded, e.g. from cron. Default is to use the keyring.")
+    optp.add_option('--cachedir', metavar='DIR',
+            help="Cache dir for LP API. Default: ~/.launchpadlib/cache")
+    optp.add_option('--debug', action="store_true", help="Output debug messages.")
+
+    (opts, args) = optp.parse_args()
+
+    if len(args) == 0:
+        optp.error("Need a LOCAL_BZR_DIR")
+    if len(args) == 1:
+        optp.error("Need at least one TEAM")
+
+    # Strip None vals so we use the defaults from LPMirror __init__
+    opts_dict = vars(opts)
+    for k,v in opts_dict.items():
+        if v is None: del(opts_dict[k])
+    opts_dict['local_bzr'] = args[0]
+    opts_dict['teams']     = args[1:]
+
+    obj = LPMirror(**opts_dict)
+    obj.mirror()
+    return 0
+
+if __name__ == "__main__":
+    main()

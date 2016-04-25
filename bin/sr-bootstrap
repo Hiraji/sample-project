@@ -1,0 +1,189 @@
+#!/usr/bin/env python
+
+import re, os, sys, platform, logging, subprocess
+from   sys    import stdout, exit
+from   shutil import copy
+import optparse
+
+supported_distributions = {
+    'Ubuntu': ['lucid', 'natty', 'oneiric']
+}
+# No Maverick as deps are not availiable. See
+# http://answers.ros.org/question/28101/ubuntu-maverick-install-of-ros-electric-pr2
+
+supported_ros_releases = ['electric']
+
+# Filled in by pre_flight()
+dist = { 'name': '', 'release': '', 'version': '' }
+
+# Command line opts
+opts = None
+
+# Where to find the rosinstall file etc
+data_dir = os.path.join(os.path.abspath(os.path.dirname(sys.argv[0])), "..", "data")
+
+#
+# Logging and util
+
+log = logging.getLogger('hello')
+log.setLevel(logging.DEBUG)
+
+def giveup(msg, status=1):
+    """Log error message and exit"""
+    log.critical(msg)
+    log.info("Giving up!")
+    exit(status)
+
+def sh(cmd):
+    """Run a shell command, echoing the command first"""
+    log.info(cmd)
+    subprocess.check_call([cmd], shell=True)
+
+
+#
+# main
+
+def main():
+    global opts
+    optp = optparse.OptionParser()
+    optp.add_option('--ros-release', '--ros', default="electric")
+    optp.add_option('--quiet', '-q', action="store_true", default=False)
+    opts, args = optp.parse_args()
+
+    opts.workspace = ""
+    if len(args) > 0:
+        opts.workspace = args[0]
+
+    ch = logging.StreamHandler()
+    if opts.quiet:
+        level = logging.WARNING
+    else:
+        level = logging.INFO
+    ch.setLevel(level)
+    ch.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    log.addHandler(ch)
+
+    log.info("Starting bootstrap")
+    pre_flight()
+    configure_repositories()
+    install_packages()
+    install_workspace()
+    log.info("Finished bootstrap")
+
+def pre_flight():
+    """Pre flight checks"""
+    # TODO Force option to try and install anyway
+    # This should maybe test if there is anything todo, if not we can abort
+    # nice and quickly. Useful as we will run at start of each jenkins build.
+
+    if os.name != 'posix' and platform.system() != 'Linux':
+        giveup("Not a linux system!")
+
+    if os.geteuid() != 0:
+        giveup("You must be root (or use sudo)!")
+
+    (dist['name'], dist['version'], dist['release']) = platform.linux_distribution()
+    log.info("Looks like %s %s (%s) flavor linux"
+            % (dist['name'], dist['release'], dist['version']))
+
+    if dist['name'] not in supported_distributions:
+        giveup("Not a compatable system. Supported: "+str(supported_distributions.keys()))
+
+    if dist['release'] not in supported_distributions[dist['name']]:
+        giveup("Un-supported Ubuntu release %s, supported: %s"
+            % (dist['release'], str(supported_distributions[dist['name']]))
+        )
+
+    log.info("Pre-flight checks ... OK")
+
+def configure_repositories():
+    """Sort out the sources lists and keys and apt-get update"""
+    #https://help.ubuntu.com/community/Repositories/CommandLine
+
+    sources = "/etc/apt/sources.list"
+    try:
+        lines = open(sources).readlines()
+    except IOError as err:
+        giveup("Reading '%s' : %s" % (sources, err), err.errno)
+
+    # Update source.list, out_lines is the new content, is_changed tells us if
+    # we need to write it.
+    out_lines     = []
+    is_changed    = False
+    re_needed_src = re.compile(r'#\s*deb(-src)? http:.*(restricted|universe|multiverse)$')
+    re_excludes   = re.compile(r'backports ')
+    re_start_hash = re.compile(r'^#\s*');
+    for line in lines:
+        m = re_needed_src.search(line)
+        if re_needed_src.search(line) and not re_excludes.search(line):
+            is_changed = True
+            out_line = re_start_hash.sub('', line)
+            out_lines.append(out_line)
+        else:
+            out_lines.append(line)
+
+    if is_changed:
+        bak_file = sources + ".sr-bootstrap-backup"
+        try:
+            copy(sources, bak_file)
+            out = open(sources, "w")
+            out.writelines(out_lines)
+        except IOError as err:
+            giveup("Updating '%s' : %s" % (sources, err), err.errno)
+        else:
+            log.info("Wrote '"+sources+"' (backup '"+bak_file+"')")
+
+    log.info("Restricted, universe and multiverse active")
+    sh('wget http://packages.ros.org/ros.key -O - | sudo apt-key add -')
+    log.info('Added ros apt key')
+
+    deb_line = "deb http://packages.ros.org/ros/ubuntu %s main" % dist['release']
+    src_file = "/etc/apt/sources.list.d/ros-latest.list"
+    if os.path.isfile(src_file):
+        # TODO Test that the file looks ok
+        log.info("ros-latest.list already installed")
+    else:
+        sh('echo "'+deb_line+'" > /etc/apt/sources.list.d/ros-latest.list')
+        log.info('Source - %s' % deb_line)
+
+    log.info("Configured repositories ... OK")
+
+def install_packages():
+    """Install ROS packages and related tools"""
+
+    # http://www.ros.org/wiki/Robots/Shadow%20Robot/detailed_electric_trunk
+    # http://www.ros.org/wiki/electric/Installation/Ubuntu
+    # http://www.ros.org/wiki/Robots/PR2/electric says ros-electric-pr2-desktop
+    pkg = "ros-"+opts.ros_release+"-pr2-desktop"
+    apt_opts = '-q --yes'
+    sh("apt-get update")
+    sh('apt-get install %s %s' % (apt_opts, pkg))
+    sh('apt-get install %s bzr' % apt_opts) # bzr-explorer qbzr
+    sh('apt-get install %s subversion python-svn' % apt_opts)
+    sh('apt-get install %s mercurial' % apt_opts)
+
+    # rosinstall is a seperate install http://www.ros.org/wiki/rosinstall
+    sh("apt-get install --yes python-setuptools")
+    sh("easy_install -U rosinstall")
+
+    log.info('Installed packages ... OK')
+
+def install_workspace():
+    """Set up the workspace (rosinstall)"""
+    if not opts.workspace:
+        return
+
+    # Our lp: uris get changed so that rosinstall thinks they have changed. So
+    # we use --delete-changed-uris to force an update.
+    # TODO: Fix properly. Probably means fix the url. Otherwise we will do alot
+    # of extra downloading and building, slowing the builds down.
+    ros_dir = '/opt/ros/' + opts.ros_release
+    install_file = data_dir + '/shadow_robot.rosinstall'
+    sh('rosinstall --delete-changed-uris ' + opts.workspace + ' ' + install_file + ' ' + ros_dir)
+    log.info("Workspace setup in "+opts.workspace)
+    log.info("source "+opts.workspace+"/setup.bash to setup your ROS env")
+
+
+# Go...
+if __name__ == '__main__':
+    main()
